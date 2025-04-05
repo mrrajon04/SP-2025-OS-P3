@@ -1,160 +1,109 @@
-#include <stdio.h>
-#include <stdbool.h>
-#include <sys/mman.h>
-#include <string.h>
-#include <stddef.h>
-#include <assert.h>
-#include <signal.h>
-#include <execinfo.h>
-#include <unistd.h>
-#include <time.h>
-#ifdef __APPLE__
-#include <sys/errno.h>
-#else
-#include <errno.h>
-#endif
-
+// Updated src/lab.c
 #include "lab.h"
+#include <sys/mman.h>
+#include <errno.h>
+#include <string.h>
+#include <signal.h>
+#include <stddef.h>
 
 #define handle_error_and_die(msg) \
     do                            \
     {                             \
         perror(msg);              \
-        raise(SIGKILL);          \
+        raise(SIGKILL);           \
     } while (0)
 
-/**
- * @brief Convert bytes to the correct K value
- *
- * @param bytes the number of bytes
- * @return size_t the K value that will fit bytes
- */
-size_t btok(size_t bytes)
-{
-    //DO NOT use math.pow
+size_t btok(size_t bytes) {
+    size_t kval = MIN_K;
+    size_t block_size = (1UL << kval);
+    while (block_size < bytes + sizeof(struct avail)) {
+        kval++;
+        block_size <<= 1;
+    }
+    return kval;
 }
 
-struct avail *buddy_calc(struct buddy_pool *pool, struct avail *buddy)
-{
-
+struct avail *buddy_calc(struct buddy_pool *pool, struct avail *block) {
+    size_t block_offset = (size_t)((char *)block - (char *)pool->base);
+    size_t buddy_offset = block_offset ^ (1UL << block->kval);
+    return (struct avail *)((char *)pool->base + buddy_offset);
 }
 
-void *buddy_malloc(struct buddy_pool *pool, size_t size)
-{
-
-    //get the kval for the requested size with enough room for the tag and kval fields
-
-    //R1 Find a block
-
-    //There was not enough memory to satisfy the request thus we need to set error and return NULL
-
-    //R2 Remove from list;
-
-    //R3 Split required?
-
-    //R4 Split the block
-
+void *buddy_malloc(struct buddy_pool *pool, size_t size) {
+    size_t kval = btok(size);
+    for (size_t k = kval; k <= pool->kval_m; k++) {
+        if (pool->avail[k].next != &pool->avail[k]) {
+            struct avail *block = pool->avail[k].next;
+            block->prev->next = block->next;
+            block->next->prev = block->prev;
+            while (k > kval) {
+                k--;
+                struct avail *buddy = (struct avail *)((char *)block + (1UL << k));
+                buddy->kval = k;
+                buddy->tag = BLOCK_AVAIL;
+                buddy->next = buddy->prev = &pool->avail[k];
+                pool->avail[k].next = pool->avail[k].prev = buddy;
+                block->kval = k;
+            }
+            block->tag = BLOCK_RESERVED;
+            return (void *)(block + 1);
+        }
+    }
+    errno = ENOMEM;
+    return NULL;
 }
 
-void buddy_free(struct buddy_pool *pool, void *ptr)
-{
+void buddy_free(struct buddy_pool *pool, void *ptr) {
+    if (!ptr) return;
 
-}
+    struct avail *block = ((struct avail *)ptr) - 1;
+    block->tag = BLOCK_AVAIL;
 
-/**
- * @brief This is a simple version of realloc.
- *
- * @param poolThe memory pool
- * @param ptr  The user memory
- * @param size the new size requested
- * @return void* pointer to the new user memory
- */
-void *buddy_realloc(struct buddy_pool *pool, void *ptr, size_t size)
-{
-    //Required for Grad Students
-    //Optional for Undergrad Students
-}
-
-void buddy_init(struct buddy_pool *pool, size_t size)
-{
-    size_t kval = 0;
-    if (size == 0)
-        kval = DEFAULT_K;
-    else
-        kval = btok(size);
-
-    if (kval < MIN_K)
-        kval = MIN_K;
-    if (kval > MAX_K)
-        kval = MAX_K - 1;
-
-    //make sure pool struct is cleared out
-    memset(pool,0,sizeof(struct buddy_pool));
-    pool->kval_m = kval;
-    pool->numbytes = (UINT64_C(1) << pool->kval_m);
-    //Memory map a block of raw memory to manage
-    pool->base = mmap(
-        NULL,                               /*addr to map to*/
-        pool->numbytes,                     /*length*/
-        PROT_READ | PROT_WRITE,             /*prot*/
-        MAP_PRIVATE | MAP_ANONYMOUS,        /*flags*/
-        -1,                                 /*fd -1 when using MAP_ANONYMOUS*/
-        0                                   /* offset 0 when using MAP_ANONYMOUS*/
-    );
-    if (MAP_FAILED == pool->base)
-    {
-        handle_error_and_die("buddy_init avail array mmap failed");
+    while (block->kval < pool->kval_m) {
+        struct avail *buddy = buddy_calc(pool, block);
+        if (buddy->tag != BLOCK_AVAIL || buddy->kval != block->kval) break;
+        buddy->prev->next = buddy->next;
+        buddy->next->prev = buddy->prev;
+        if (buddy < block) block = buddy;
+        block->kval++;
     }
 
-    //Set all blocks to empty. We are using circular lists so the first elements just point
-    //to an available block. Thus the tag, and kval feild are unused burning a small bit of
-    //memory but making the code more readable. We mark these blocks as UNUSED to aid in debugging.
-    for (size_t i = 0; i <= kval; i++)
-    {
+    block->next = pool->avail[block->kval].next;
+    block->prev = &pool->avail[block->kval];
+    pool->avail[block->kval].next->prev = block;
+    pool->avail[block->kval].next = block;
+}
+
+void buddy_init(struct buddy_pool *pool, size_t size) {
+    size_t kval = (size == 0) ? DEFAULT_K : btok(size);
+    if (kval < MIN_K) kval = MIN_K;
+    if (kval > MAX_K) kval = MAX_K - 1;
+
+    memset(pool, 0, sizeof(struct buddy_pool));
+    pool->kval_m = kval;
+    pool->numbytes = (1UL << kval);
+
+    pool->base = mmap(NULL, pool->numbytes, PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (pool->base == MAP_FAILED)
+        handle_error_and_die("buddy_init mmap failed");
+
+    for (size_t i = 0; i <= kval; i++) {
         pool->avail[i].next = pool->avail[i].prev = &pool->avail[i];
         pool->avail[i].kval = i;
         pool->avail[i].tag = BLOCK_UNUSED;
     }
 
-    //Add in the first block
-    pool->avail[kval].next = pool->avail[kval].prev = (struct avail *)pool->base;
-    struct avail *m = pool->avail[kval].next;
-    m->tag = BLOCK_AVAIL;
-    m->kval = kval;
-    m->next = m->prev = &pool->avail[kval];
+    struct avail *block = (struct avail *)pool->base;
+    block->tag = BLOCK_AVAIL;
+    block->kval = kval;
+    block->next = block->prev = &pool->avail[kval];
+    pool->avail[kval].next = pool->avail[kval].prev = block;
 }
 
-void buddy_destroy(struct buddy_pool *pool)
-{
-    int rval = munmap(pool->base, pool->numbytes);
-    if (-1 == rval)
-    {
-        handle_error_and_die("buddy_destroy avail array");
-    }
-    //Zero out the array so it can be reused it needed
-    memset(pool,0,sizeof(struct buddy_pool));
+void buddy_destroy(struct buddy_pool *pool) {
+    if (munmap(pool->base, pool->numbytes) == -1)
+        handle_error_and_die("buddy_destroy munmap failed");
+    memset(pool, 0, sizeof(struct buddy_pool));
 }
 
-#define UNUSED(x) (void)x
-
-/**
- * This function can be useful to visualize the bits in a block. This can
- * help when figuring out the buddy_calc function!
- */
-static void printb(unsigned long int b)
-{
-     size_t bits = sizeof(b) * 8;
-     unsigned long int curr = UINT64_C(1) << (bits - 1);
-     for (size_t i = 0; i < bits; i++)
-     {
-          if (b & curr)
-          {
-               printf("1");
-          }
-          else
-          {
-               printf("0");
-          }
-          curr >>= 1L;
-     }
-}
