@@ -5,35 +5,45 @@
 #include <errno.h>
 #include <string.h>
 #include <signal.h>
+#include <inttypes.h>
+#include <stddef.h>
+#include <stdbool.h>
+#include <unistd.h>
 
 #define handle_error_and_die(msg) \
     do { perror(msg); raise(SIGKILL); } while (0)
 
 // Function to calculate the smallest power of 2 block size (kval) that can fit the requested size
 size_t btok(size_t bytes) {
-    if (bytes == 0) return MIN_K; // Return the smallest block size for zero-byte requests
-    size_t k = MIN_K; // Start with the minimum block size
-    size_t block_size = (1UL << k); // Calculate the block size as 2^k
-
-    // Increment `k` until the block size is large enough to fit the requested bytes + metadata
-    while (block_size < bytes + sizeof(struct avail)) {
-        k++;
-        block_size <<= 1; // Double the block size using bitwise left shift
+    int kval = 0;
+    // Find the smallest power k such that 2^k is greater than or equal to bytes.
+    while ((UINT64_C(1) << kval) < (uint64_t)bytes) {
+        kval++;
     }
-    fprintf(stderr, "btok: bytes=%zu, kval=%zu\n", bytes, k);
-    return k;
+    return (size_t)kval;
 }
 
 // Function to calculate the buddy block's address using XOR
 struct avail *buddy_calc(struct buddy_pool *pool, struct avail *block) {
-    size_t offset = (char *)block - (char *)pool->base; // Calculate the offset of the block from the base
-    size_t buddy_offset = offset ^ (1UL << block->kval); // XOR the offset with 2^kval to find the buddy's offset
-    return (struct avail *)((char *)pool->base + buddy_offset); // Return the buddy's address
+    if (!pool || !block) {
+        errno = ENOMEM;
+        return NULL;
+    }
+
+    uintptr_t base_addr = (uintptr_t)pool->base;
+    uintptr_t block_addr = (uintptr_t)block;
+    size_t block_size = (UINT64_C(1) << block->kval);
+
+    uintptr_t buddy_offset = (block_addr - base_addr) ^ block_size;
+    uintptr_t buddy_addr = base_addr + buddy_offset;
+
+    return (struct avail *)buddy_addr;
 }
 
 // Function to allocate memory from the buddy pool
 void *buddy_malloc(struct buddy_pool *pool, size_t size) {
     if (pool == NULL) {
+        errno = ENOMEM;
         return NULL;
     }
 
@@ -41,105 +51,106 @@ void *buddy_malloc(struct buddy_pool *pool, size_t size) {
     size_t totalSize = (size == 0) ? 1 : size + sizeof(struct avail); // Include metadata in the size
     size_t kval = btok(totalSize); // Get the smallest kval that fits the total size
 
-    if (kval < SMALLEST_K) {
-        kval = SMALLEST_K; // Enforce minimum block size
+    // Enforce a minimum block size only if the pool is large enough
+    if (kval < SMALLEST_K && pool->kval_m >= SMALLEST_K) {
+        kval = SMALLEST_K;
     }
+
     if (kval > pool->kval_m) {
         errno = ENOMEM; // Request exceeds pool size
         return NULL;
     }
 
-    fprintf(stderr, "buddy_malloc: size=%zu, totalSize=%zu, kval=%zu\n", size, totalSize, kval);
+    size_t j = kval;
+    bool block_found = false;
 
-    // Find the smallest available block that’s large enough
-    size_t currentK = kval;
-    struct avail *block = NULL;
-    while (currentK <= pool->kval_m) {
-        if (pool->avail[currentK].next != &pool->avail[currentK]) {
-            block = pool->avail[currentK].next; // Found a block
+    // Search for a free block starting at order 'kval' up to the maximum order
+    while (j <= pool->kval_m) {
+        if (pool->avail[j].next != &pool->avail[j]) {
+            block_found = true;
             break;
         }
-        currentK++;
+        j++;
     }
 
-    if (block == NULL) {
-        errno = ENOMEM; // No block found
+    if (!block_found) {
+        errno = ENOMEM;
         return NULL;
     }
 
-    // Remove the block from its current list
+    // Remove the block from the free list
+    struct avail *block = pool->avail[j].next;
     block->prev->next = block->next;
     block->next->prev = block->prev;
 
-    // Split the block if it’s too large
-    while (block->kval > kval) {
-        block->kval--;
-        size_t newSize = (1UL << block->kval);
+    // Split the block until we reach the desired order
+    while (j > kval) {
+        j--;
+        uintptr_t addr = (uintptr_t)block;
+        uintptr_t buddy_addr = addr + (UINT64_C(1) << j);
+        struct avail *buddy = (struct avail *)buddy_addr;
 
-        struct avail *buddy = (struct avail *)((char *)block + newSize);
         buddy->tag = BLOCK_AVAIL;
-        buddy->kval = block->kval;
+        buddy->kval = j;
 
-        struct avail *list_head = &pool->avail[buddy->kval];
-        buddy->next = list_head->next;
-        buddy->prev = list_head;
-        list_head->next->prev = buddy;
-        list_head->next = buddy;
+        // Insert buddy into the free list for order j
+        buddy->next = pool->avail[j].next;
+        buddy->prev = &pool->avail[j];
+        pool->avail[j].next->prev = buddy;
+        pool->avail[j].next = buddy;
+
+        // Update the current block's order
+        block->kval = j;
     }
 
-    block->tag = BLOCK_RESERVED; // Mark the block as reserved
+    block->tag = BLOCK_RESERVED;
 
-    // Debugging output
-    fprintf(stderr, "buddy_malloc: Allocated block at %p with kval=%zu\n", block, (size_t)block->kval);
-
-    return (void *)((char *)block + sizeof(struct avail)); // Return the memory block
+    // Return a pointer to the usable memory (after the metadata header)
+    return (void *)(block + 1);
 }
 
 // Function to free a previously allocated memory block
 void buddy_free(struct buddy_pool *pool, void *ptr) {
-    if (ptr == NULL) return;
+    if (!pool || !ptr)
+        return;
 
-    struct avail *block = (struct avail *)((char *)ptr - sizeof(struct avail));
-    if (block->tag != BLOCK_RESERVED) return;
+    // Adjust pointer back to the metadata header.
+    struct avail *block = (struct avail *)ptr - 1;
+    size_t kval = block->kval;
 
+    // Mark block as free.
     block->tag = BLOCK_AVAIL;
-    size_t current_k = block->kval;
 
-    while (current_k < pool->kval_m) {
+    // Attempt to merge with buddy as long as we haven't reached the maximum order.
+    while (kval < pool->kval_m) {
         struct avail *buddy = buddy_calc(pool, block);
 
-        // Check if buddy is valid and available
-        if ((char *)buddy >= (char *)pool->base + pool->numbytes ||
-            buddy->tag != BLOCK_AVAIL || 
-            buddy->kval != current_k) {
+        // If buddy_calc returns the same block or the buddy isn't free at the same order, stop merging.
+        if (buddy == block || !(buddy->tag == BLOCK_AVAIL && buddy->kval == kval))
             break;
-        }
 
-        // Remove buddy from its list
+        // Remove buddy from its free list.
         buddy->prev->next = buddy->next;
         buddy->next->prev = buddy->prev;
 
-        // Use the lower address as the new block
-        block = (block < buddy) ? block : buddy;
-        current_k++;
-        block->kval = current_k;
+        // Use the lower address between the block and its buddy.
+        if ((uintptr_t)buddy < (uintptr_t)block)
+            block = buddy;
+
+        kval++;
+        block->kval = kval;
     }
 
-    // Add the block to its availability list
-    struct avail *list_head = &pool->avail[current_k];
-    block->next = list_head->next;
-    block->prev = list_head;
-    list_head->next->prev = block;
-    list_head->next = block;
-
-    // Debugging output
-    fprintf(stderr, "buddy_free: Freed block at %p with kval=%zu\n", block, (size_t)block->kval);
+    // Reinsert the (possibly merged) block into the free list.
+    block->prev = &pool->avail[kval];
+    block->next = pool->avail[kval].next;
+    pool->avail[kval].next->prev = block;
+    pool->avail[kval].next = block;
 }
 
 // Function to initialize the buddy memory pool
 void buddy_init(struct buddy_pool *pool, size_t size) {
-    size_t kval = (size == 0) ? DEFAULT_K : btok(size);
-
+    size_t kval = size == 0 ? DEFAULT_K : btok(size);
     if (kval < MIN_K) kval = MIN_K;
     if (kval > MAX_K) kval = MAX_K - 1;
 
@@ -149,28 +160,30 @@ void buddy_init(struct buddy_pool *pool, size_t size) {
 
     pool->base = mmap(NULL, pool->numbytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (MAP_FAILED == pool->base) {
-        handle_error_and_die("buddy_init mmap failed");
+        handle_error_and_die("buddy_init avail array mmap failed");
     }
 
+    // Initialize free list
     for (size_t i = 0; i <= kval; i++) {
         pool->avail[i].next = pool->avail[i].prev = &pool->avail[i];
         pool->avail[i].kval = i;
         pool->avail[i].tag = BLOCK_UNUSED;
     }
 
-    struct avail *block = (struct avail *)pool->base;
-    block->tag = BLOCK_AVAIL;
-    block->kval = kval;
-    block->next = block->prev = &pool->avail[kval];
-    pool->avail[kval].next = pool->avail[kval].prev = block;
-
-    fprintf(stderr, "buddy_init: Initialized pool with base=%p, size=%zu\n", pool->base, pool->numbytes);
+    pool->avail[kval].next = pool->avail[kval].prev = (struct avail *)pool->base;
+    struct avail *m = pool->avail[kval].next;
+    m->tag = BLOCK_AVAIL;
+    m->kval = kval;
+    m->next = m->prev = &pool->avail[kval];
 }
 
 // Function to destroy the buddy memory pool
 void buddy_destroy(struct buddy_pool *pool) {
-    if (munmap(pool->base, pool->numbytes) == -1) // Unmap the memory pool
-        handle_error_and_die("buddy_destroy munmap failed");
-    memset(pool, 0, sizeof(struct buddy_pool)); // Clear the pool structure
+    int rval = munmap(pool->base, pool->numbytes);
+    if (-1 == rval) {
+        handle_error_and_die("buddy_destroy avail array");
+    }
+    memset(pool, 0, sizeof(struct buddy_pool));
 }
+
 
